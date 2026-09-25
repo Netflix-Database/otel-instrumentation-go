@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      # The otel modules are released in lockstep and their versions must match,
+      # so they are updated as one PR rather than a dozen conflicting ones.
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-patch"]

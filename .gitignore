@@ -1,0 +1,8 @@
+# secrets
+.npmrc
+.env
+.env.*
+!.env.example
+*.pem
+*.pfx
+*.p12

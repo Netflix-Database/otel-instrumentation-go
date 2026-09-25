@@ -1,13 +1,13 @@
 # otel-instrumentation-go
 
-Small helpers for wiring OpenTelemetry traces, metrics, and logs in Go services, plus HTTP request ID middleware.
+Shared OpenTelemetry, logging and health wiring for Netdb's Go services.
+Services depend on this package instead of configuring the SDK themselves, so
+every service emits the same span attributes, the same log schema and the same
+metrics — which is what makes one Grafana dashboard work across all of them.
 
-## What this package provides
-
-- OTel SDK setup for traces, metrics, and logs via OTLP/gRPC
-- A Zap logger that writes to both console and OpenTelemetry logs
-- A context-aware logger helper that attaches `trace_id` and `span_id`
-- HTTP middleware that ensures `X-Request-Id` is present and adds it to the active span
+The Node equivalent is `otel-instrumentation-next`. The two are kept in
+deliberate lockstep: same header, same baggage key, same health paths, same
+semconv version, same log field names.
 
 ## Installation
 
@@ -22,101 +22,225 @@ package main
 
 import (
 	"context"
-	"log"
+	"net/http"
 
 	otel "github.com/Netflix-Database/otel-instrumentation-go"
+	otelhttp "github.com/Netflix-Database/otel-instrumentation-go/http"
 )
 
 func main() {
 	ctx := context.Background()
 
+	// Fails immediately with every configuration problem listed.
 	shutdown, err := otel.SetupOTelSDK(ctx)
 	if err != nil {
-		log.Fatalf("failed to set up OpenTelemetry: %v", err)
+		panic(err)
 	}
-	defer func() {
-		if err := shutdown(context.Background()); err != nil {
-			log.Printf("failed to shut down OpenTelemetry: %v", err)
-		}
-	}()
 
-	logger := otel.CreateLogger("my-service")
+	logger := otel.CreateLogger("orders-api")
+
+	mux := http.NewServeMux()
+	otelhttp.RegisterHealth(mux, []otelhttp.DependencyCheck{
+		{Name: "db", Check: db.PingContext},
+		{Name: "redis", Check: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
+	}, 0)
+
+	srv := &http.Server{Addr: ":8080", Handler: otelhttp.RequestIDMiddleware(mux)}
+	go func() { _ = srv.ListenAndServe() }()
+
 	logger.Info("service started")
+
+	// Drains the server, closes dependencies, then flushes telemetry.
+	_ = otel.WaitForShutdown(otel.ShutdownOptions{
+		Server:            srv,
+		CloseDependencies: func(ctx context.Context) error { return db.Close() },
+		Shutdown:          shutdown,
+	})
 }
 ```
 
-## Logger helpers
+## Graceful shutdown
 
-### `CreateLogger(name string) *zap.Logger`
+`WaitForShutdown` blocks on SIGTERM/SIGINT and then drains in a fixed order:
 
-Creates a Zap logger with a tee core:
+1. stop accepting requests, finish in-flight ones
+2. close db/redis/rabbit connections
+3. flush the OTel exporters
 
-- human-readable console output to stdout
-- OpenTelemetry log output via the configured OTel logger provider
+Exporters go last on purpose: draining and closing pools both produce spans, and
+anything recorded after the flush is lost — which is exactly the telemetry you
+want when a deploy goes wrong.
 
-```go
-logger := otel.CreateLogger("orders-api")
-logger.Info("ready")
-```
+`Timeout` defaults to 15s and must stay below your orchestrator's grace period,
+or the flush never completes before SIGKILL.
 
-### `LoggerFromContext(ctx, name) *zap.Logger`
+## Health endpoints
 
-Returns a logger that includes trace correlation fields when a valid span context is present:
-
-- `trace_id`
-- `span_id`
-
-```go
-logger := otel.LoggerFromContext(ctx, "orders-api")
-logger.Info("processing request")
-```
-
-## HTTP request ID middleware
-
-Package `github.com/Netflix-Database/otel-instrumentation-go/http` provides middleware:
-
-- reads `X-Request-Id` from incoming requests
-- generates one if missing
-- sets `X-Request-Id` on the response
-- writes `request.id` span attribute on the active span
+This builds on [`hellofresh/health-go`](https://github.com/hellofresh/health-go)
+rather than replacing it, so its ready-made probes work unchanged — a
+`DependencyCheck.Check` is exactly a `health.CheckFunc`:
 
 ```go
-package main
-
 import (
-	"fmt"
-	"net/http"
-
-	otelhttp "github.com/Netflix-Database/otel-instrumentation-go/http"
+    healthMySql "github.com/hellofresh/health-go/v5/checks/mysql"
+    healthRedis "github.com/hellofresh/health-go/v5/checks/redis"
 )
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = fmt.Fprintln(w, "ok")
-	})
-
-	handler := otelhttp.RequestIDMiddleware(mux)
-	_ = http.ListenAndServe(":8080", handler)
-}
+otelhttp.RegisterHealth(mux,
+    otelhttp.DependencyCheck{
+        Name:  "db",
+        Check: healthMySql.New(healthMySql.Config{DSN: dsn}),
+    },
+    otelhttp.DependencyCheck{
+        Name:  "redis",
+        Check: healthRedis.New(healthRedis.Config{DSN: redisDSN}),
+    },
+    otelhttp.DependencyCheck{
+        Name:        "search",
+        Check:       func(ctx context.Context) error { return search.Ping(ctx) },
+        NonCritical: true,
+    },
+)
 ```
 
-## Environment configuration
+It mounts `/livez` and `/readyz`. All this package adds is the two paths and a
+response body identical to the .NET and Node services — health-go's own
+`Handler()` emits a different shape (`failures`, `system`, `component`), which
+the shared dashboard cannot parse.
 
-### `OTEL_PRETTY_PRINT=true`
+`/livez` runs **no checks at all** — a liveness probe that touches the database
+restarts the app whenever the database blips, turning a dependency outage into
+an outage plus a restart loop. Its body is `{"status":"ok"}` with no `checks`
+key.
 
-When set to `true`, this package creates local SDK providers without OTLP exporters. This is useful for local development when no collector is running.
+`/readyz` returns 503 when a critical check fails, and 200 + `"degraded"` when
+only `NonCritical` ones do — that is health-go's `SkipOnErr`, so the mapping is
+its `Unavailable`/`Partially Available` split rather than bookkeeping of our
+own. Each check gets a 3s timeout by default, enforced by health-go, so one
+hung dependency cannot hold the probe open.
 
-When `OTEL_PRETTY_PRINT` is not `true`, exporters are created with default OTLP/gRPC settings from the OpenTelemetry Go SDK and standard `OTEL_*` environment variables.
+`duration_ms` is measured by this package: health-go reports *which* checks
+failed but not how long each took, and that field is part of the response
+contract shared with the other two languages.
 
-Common variables include:
+## Request id and baggage
 
-- `OTEL_EXPORTER_OTLP_ENDPOINT`
-- `OTEL_EXPORTER_OTLP_HEADERS`
-- `OTEL_RESOURCE_ATTRIBUTES`
+```go
+// Public edge: inbound baggage is dropped entirely.
+handler := otelhttp.RequestIDMiddleware(mux)
 
-## Notes
+// Internal service: keep specific keys from callers you trust.
+handler := otelhttp.RequestIDMiddlewareWithOptions(otelhttp.Options{
+	TrustInboundBaggage: true,
+	AllowedBaggageKeys:  []string{"request.id", "tenant.id"},
+})(mux)
 
-- Call the `shutdown` function returned by `SetupOTelSDK` during graceful shutdown so buffered telemetry is flushed.
-- `RequestIDMiddleware` expects an active span in request context to attach `request.id`; if no active span exists, setting the attribute is a no-op.
+// Outbound: carries trace context and the request id to the next service.
+req = otelhttp.InjectOutbound(req)
+```
+
+An inbound `X-Request-Id` is reused only if it is at most 128 characters and
+matches `[A-Za-z0-9_.:-]+`. It reaches log lines and span attributes, so an
+unchecked value is a log-forging vector and an unbounded metric cardinality
+source — a comma alone would corrupt the baggage header.
+
+Inbound baggage can never overwrite the request id, even from a trusted caller:
+a compromised internal service should not be able to relabel everyone else's
+traces.
+
+`traceparent` is deliberately left alone. Dropping it would break distributed
+traces, and unlike baggage it is structurally validated and carries no
+free-form values.
+
+## Errors on spans
+
+```go
+otel.RecordErrorOnContext(ctx, err)
+// or
+err := otel.WithErrorRecording(ctx, func(ctx context.Context) error { ... })
+```
+
+`RecordError` alone leaves the span status Unset, so the span is not counted as
+a failure and "error rate per endpoint" under-reports. These helpers always do
+both.
+
+## Logging
+
+zap, teed to the console and the OTLP log pipeline. `LoggerFromContext`
+and `WithContext` attach `trace_id`, `span_id` and `request.id`.
+
+Secrets are redacted before anything reaches a sink, under a contract shared
+verbatim with the other two libraries — a secret that leaks in one language must
+leak in all three, or the weakest service decides what ends up in the log
+backend:
+
+1. A name is **normalised** before matching: lowercased, with `-`, `_`, `.` and
+   spaces removed. `api_key`, `apiKey`, `X-API-KEY` and `Api.Key` all reduce to
+   `apikey`. HTTP header names are hyphenated and headers are the most common
+   accidental leak.
+2. The normalised name is **substring-matched** against `password`, `passwd`,
+   `secret`, `token`, `apikey`, `authorization`, `cookie`, `credential`. The
+   usual leak is a field that gained a secret months after the logging call was
+   written, so `sessionToken` and `db_credential` match too.
+3. A match replaces the **entire value** with `[redacted]`, whatever its type —
+   the contents of a matching key are never inspected.
+4. Matching applies at **every depth** up to 8, not only to top-level fields.
+
+A value with nothing to censor is passed through as the instance it arrived as,
+so clean log lines keep their exact shape and cost one walk with no allocation.
+Only the branches holding a secret are rebuilt.
+
+The walk covers `zap.Any`/`zap.Reflect` values, `zap.Object`/`zap.Array`
+marshalers and `zap.Namespace`, and both the console and the exporter see the
+censored values — redacting in only one place is how secrets end up in exactly
+the backend you forgot about.
+
+In development (`OTEL_SDK_DISABLED=true`) the logger prints colourised console
+output and attaches no exporter.
+
+## Configuration
+
+Validated at startup by `LoadConfig()`, which reports every problem at once
+rather than one redeploy at a time. See `.env.example`.
+
+| Variable | Notes |
+|---|---|
+| `OTEL_SDK_DISABLED` | `true` in dev. Nothing else is then required. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | The collector endpoint. Use the gRPC port (4317) - the exporters are gRPC. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Must contain `service.name`, `service.version`, `service.instance.id`, `deployment.environment.name`, `cloud.region`. |
+| `OTEL_TRACES_SAMPLER_ARG` | Parent-based ratio, 0.0–1.0, default 1.0. |
+| `OTEL_SEMCONV_STABILITY_OPT_IN` | Set to `database,http` automatically; your value is merged. |
+| `LOG_LEVEL` | Defaults to `debug` when disabled, `info` otherwise. |
+
+> **Note:** `OTEL_PRETTY_PRINT` from previous versions is gone. Use
+> `OTEL_SDK_DISABLED=true`, which is the standard OTel variable and matches the
+> Node services.
+
+## Semantic conventions
+
+This package targets **semconv 1.43.0** and sets
+`OTEL_SEMCONV_STABILITY_OPT_IN=database,http` in `init()`.
+
+Attribute names moved between versions — `db.statement` became `db.query.text`,
+`db.system` became `db.system.name`. The shared dashboards are built against
+this version, so bumping it is a breaking change for them and must happen across
+all languages at once.
+
+Set the variable in the deployment environment as well: contrib instrumentation
+packages read it when they initialise, and depending on import order `init()`
+can run too late. Setting it twice is harmless; setting it nowhere is a silent
+divergence.
+
+## Instrumentation this package does not wrap
+
+Postgres/MySQL, Redis and RabbitMQ spans come from the
+upstream libraries, called directly by each service:
+
+```go
+db, _ := otelsql.Open("mysql", dsn, otelsql.WithAttributes(...))  // github.com/XSAM/otelsql
+redisotel.InstrumentTracing(rdb)                                   // redis/go-redis/v9
+```
+
+Wrapping them here would force every consumer to pull `go-redis`, `amqp091` and
+a SQL driver into its build whether it uses them or not. The semconv opt-in this
+package sets is what keeps their attribute names aligned with the Node services.

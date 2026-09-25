@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 
-	"go.opentelemetry.io/contrib/bridges/otelzap"
+	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -15,19 +15,30 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
-	oteltrace "go.opentelemetry.io/otel/trace"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
+// SetupOTelSDK wires traces, metrics and logs over OTLP/gRPC and returns a
+// shutdown function that flushes them.
+//
+// The configuration is validated first, so a service with a bad
+// OTEL_RESOURCE_ATTRIBUTES fails at boot instead of exporting unlabelled
+// telemetry.
 func SetupOTelSDK(ctx context.Context) (func(context.Context) error, error) {
-	var shutdownFuncs []func(context.Context) error
-	var err error
+	cfg, err := LoadConfig()
+	if err != nil {
+		return func(context.Context) error { return nil }, err
+	}
+	return SetupOTelSDKWithConfig(ctx, cfg)
+}
 
-	// shutdown calls cleanup functions registered via shutdownFuncs.
-	// The errors from the calls are joined.
-	// Each registered cleanup will be invoked once.
+// SetupOTelSDKWithConfig is SetupOTelSDK with an already-validated config.
+func SetupOTelSDKWithConfig(ctx context.Context, cfg *Config) (func(context.Context) error, error) {
+	var shutdownFuncs []func(context.Context) error
+
+	// Each registered cleanup is invoked once; errors are joined so one
+	// failing exporter does not hide the others.
 	shutdown := func(ctx context.Context) error {
 		var err error
 		for _, fn := range shutdownFuncs {
@@ -37,118 +48,67 @@ func SetupOTelSDK(ctx context.Context) (func(context.Context) error, error) {
 		return err
 	}
 
-	// handleErr calls shutdown for cleanup and makes sure that all errors are returned.
-	handleErr := func(inErr error) {
-		err = errors.Join(inErr, shutdown(ctx))
+	// TraceContext plus Baggage, so the request id propagates.
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	res, err := newResource(ctx, cfg)
+	if err != nil {
+		return shutdown, err
 	}
 
-	// Set up propagator.
-	prop := newPropagator()
-	otel.SetTextMapPropagator(prop)
-
-	// Set up trace provider.
-	tracerProvider, err := newTracerProvider(ctx)
+	tracerProvider, err := newTracerProvider(ctx, cfg, res)
 	if err != nil {
-		handleErr(err)
-		return shutdown, err
+		return shutdown, errors.Join(err, shutdown(ctx))
 	}
 	shutdownFuncs = append(shutdownFuncs, tracerProvider.Shutdown)
 	otel.SetTracerProvider(tracerProvider)
 
-	// Set up meter provider.
-	meterProvider, err := newMeterProvider(ctx)
+	meterProvider, err := newMeterProvider(ctx, cfg, res)
 	if err != nil {
-		handleErr(err)
-		return shutdown, err
+		return shutdown, errors.Join(err, shutdown(ctx))
 	}
 	shutdownFuncs = append(shutdownFuncs, meterProvider.Shutdown)
 	otel.SetMeterProvider(meterProvider)
 
-	// Set up logger provider.
-	loggerProvider, err := newLoggerProvider(ctx)
+	loggerProvider, err := newLoggerProvider(ctx, cfg, res)
 	if err != nil {
-		handleErr(err)
-		return shutdown, err
+		return shutdown, errors.Join(err, shutdown(ctx))
 	}
 	shutdownFuncs = append(shutdownFuncs, loggerProvider.Shutdown)
 	global.SetLoggerProvider(loggerProvider)
 
-	return shutdown, err
-}
-
-func newPropagator() propagation.TextMapPropagator {
-	return propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	)
-}
-
-func CreateLogger(name string) *zap.Logger {
-	otelCore := otelzap.NewCore(name, otelzap.WithLoggerProvider(global.GetLoggerProvider()))
-
-	consoleEncoder := zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig())
-	consoleCore := zapcore.NewCore(consoleEncoder, zapcore.AddSync(os.Stdout), zap.InfoLevel)
-
-	tee := zapcore.NewTee(
-		consoleCore,
-		otelCore,
-	)
-
-	return zap.New(tee)
-}
-
-func LoggerFromContext(ctx context.Context, name string) *zap.Logger {
-	logger := CreateLogger(name)
-
-	spanCtx := oteltrace.SpanContextFromContext(ctx)
-	if spanCtx.IsValid() {
-		logger = logger.With(
-			zap.String("trace_id", spanCtx.TraceID().String()),
-			zap.String("span_id", spanCtx.SpanID().String()),
-		)
+	// Runtime metrics - GC, heap, goroutines - as standard
+	// instruments so one dashboard panel covers every Go service.
+	if !cfg.Disabled {
+		if err := runtime.Start(runtime.WithMeterProvider(meterProvider)); err != nil {
+			return shutdown, errors.Join(fmt.Errorf("failed to start runtime metrics: %w", err), shutdown(ctx))
+		}
 	}
 
-	return logger
+	return shutdown, nil
 }
 
-func newLoggerProvider(ctx context.Context) (*log.LoggerProvider, error) {
-	if os.Getenv("OTEL_PRETTY_PRINT") == "true" {
-		return log.NewLoggerProvider(), nil
+// newResource builds the resource from the validated attribute set
+// rather than relying on the env detector, so a typo fails at startup instead
+// of silently producing an unlabelled service.
+func newResource(ctx context.Context, cfg *Config) (*resource.Resource, error) {
+	if cfg.Disabled {
+		return resource.Default(), nil
 	}
-
-	exporter, err := otlploggrpc.New(ctx)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to create stdout log exporter: %w", err)
+	attrs := make([]attribute.KeyValue, 0, len(cfg.ResourceAttributes))
+	for k, v := range cfg.ResourceAttributes {
+		attrs = append(attrs, attribute.String(k, v))
 	}
-
-	lp := log.NewLoggerProvider(
-		log.WithProcessor(log.NewBatchProcessor(exporter)),
-	)
-
-	return lp, nil
+	return resource.New(ctx, resource.WithAttributes(attrs...))
 }
 
-func newMeterProvider(ctx context.Context) (*metric.MeterProvider, error) {
-	if os.Getenv("OTEL_PRETTY_PRINT") == "true" {
-		return metric.NewMeterProvider(), nil
-	}
-
-	exporter, err := otlpmetricgrpc.New(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create OTLP metric exporter: %w", err)
-	}
-
-	mp := metric.NewMeterProvider(
-		metric.WithReader(metric.NewPeriodicReader(exporter)),
-	)
-
-	return mp, nil
-}
-
-func newTracerProvider(ctx context.Context) (*trace.TracerProvider, error) {
-	if os.Getenv("OTEL_PRETTY_PRINT") == "true" {
-		return trace.NewTracerProvider(), nil
+func newTracerProvider(ctx context.Context, cfg *Config, res *resource.Resource) (*trace.TracerProvider, error) {
+	// No exporters in development.
+	if cfg.Disabled {
+		return trace.NewTracerProvider(trace.WithResource(res)), nil
 	}
 
 	exporter, err := otlptracegrpc.New(ctx)
@@ -156,9 +116,44 @@ func newTracerProvider(ctx context.Context) (*trace.TracerProvider, error) {
 		return nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)
 	}
 
-	tp := trace.NewTracerProvider(
+	return trace.NewTracerProvider(
+		trace.WithResource(res),
 		trace.WithBatcher(exporter),
-	)
+		// Parent-based, so a sampled trace stays sampled across
+		// service hops. Without this, distributed traces come back with holes.
+		trace.WithSampler(trace.ParentBased(trace.TraceIDRatioBased(cfg.SamplingRatio))),
+	), nil
+}
 
-	return tp, nil
+func newMeterProvider(ctx context.Context, cfg *Config, res *resource.Resource) (*metric.MeterProvider, error) {
+	if cfg.Disabled {
+		return metric.NewMeterProvider(metric.WithResource(res)), nil
+	}
+
+	exporter, err := otlpmetricgrpc.New(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OTLP metric exporter: %w", err)
+	}
+
+	return metric.NewMeterProvider(
+		metric.WithResource(res),
+		metric.WithReader(metric.NewPeriodicReader(exporter)),
+	), nil
+}
+
+func newLoggerProvider(ctx context.Context, cfg *Config, res *resource.Resource) (*log.LoggerProvider, error) {
+	// Logs go over OTLP like traces and metrics.
+	if cfg.Disabled {
+		return log.NewLoggerProvider(log.WithResource(res)), nil
+	}
+
+	exporter, err := otlploggrpc.New(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OTLP log exporter: %w", err)
+	}
+
+	return log.NewLoggerProvider(
+		log.WithResource(res),
+		log.WithProcessor(log.NewBatchProcessor(exporter)),
+	), nil
 }
