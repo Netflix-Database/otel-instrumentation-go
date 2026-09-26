@@ -105,8 +105,9 @@ func RequestIDFromContext(ctx context.Context) string {
 // InjectOutbound copies trace context, baggage and the request id header onto
 // an outbound request, so the id reaches the next service.
 //
-// otelhttp injects traceparent for instrumented clients, but nothing else sets
-// the request id header downstream services read.
+// Requests sent through http.DefaultTransport, or a transport wrapped with
+// otel.NewTransport, already get all of this. Only a client that bypasses
+// both needs it.
 func InjectOutbound(req *http.Request) *http.Request {
 	ctx := req.Context()
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))

@@ -1,6 +1,7 @@
 package otel
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -183,5 +184,31 @@ func TestCrossLanguageConstants(t *testing.T) {
 	}
 	if LivenessPath != "/livez" || ReadinessPath != "/readyz" {
 		t.Errorf("health paths drifted: %q %q", LivenessPath, ReadinessPath)
+	}
+}
+
+// The resource carries telemetry.sdk.language, which the shared dashboards
+// group and filter by.
+func TestResourceIncludesTelemetrySDK(t *testing.T) {
+	clearOTelEnv(t)
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", validAttrs)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := newResource(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, kv := range res.Attributes() {
+		got[string(kv.Key)] = kv.Value.Emit()
+	}
+	if got["telemetry.sdk.language"] != "go" {
+		t.Errorf("telemetry.sdk.language = %q, want go", got["telemetry.sdk.language"])
+	}
+	if got["service.name"] != "svc" {
+		t.Errorf("service.name = %q, want svc", got["service.name"])
 	}
 }

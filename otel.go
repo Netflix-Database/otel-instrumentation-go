@@ -88,6 +88,11 @@ func SetupOTelSDKWithConfig(ctx context.Context, cfg *Config) (func(context.Cont
 		}
 	}
 
+	// Outgoing HTTP calls get client spans and carry the request id on.
+	// After the providers are set, and also in development, where the spans go
+	// nowhere but the request id still has to reach the next service.
+	instrumentDefaultTransport()
+
 	return shutdown, nil
 }
 
@@ -102,7 +107,10 @@ func newResource(ctx context.Context, cfg *Config) (*resource.Resource, error) {
 	for k, v := range cfg.ResourceAttributes {
 		attrs = append(attrs, attribute.String(k, v))
 	}
-	return resource.New(ctx, resource.WithAttributes(attrs...))
+	// telemetry.sdk.* as well: resource.New starts empty, and without
+	// telemetry.sdk.language Go services drop out of every "by language"
+	// panel and filter on the shared dashboards.
+	return resource.New(ctx, resource.WithTelemetrySDK(), resource.WithAttributes(attrs...))
 }
 
 func newTracerProvider(ctx context.Context, cfg *Config, res *resource.Resource) (*trace.TracerProvider, error) {

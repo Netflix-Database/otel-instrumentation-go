@@ -135,7 +135,9 @@ handler := otelhttp.RequestIDMiddlewareWithOptions(otelhttp.Options{
 	AllowedBaggageKeys:  []string{"request.id", "tenant.id"},
 })(mux)
 
-// Outbound: carries trace context and the request id to the next service.
+// Outbound: nothing to do for most clients - see "Outgoing HTTP" below.
+// InjectOutbound is only for a client that bypasses both instrumented
+// transports.
 req = otelhttp.InjectOutbound(req)
 ```
 
@@ -151,6 +153,34 @@ traces.
 `traceparent` is deliberately left alone. Dropping it would break distributed
 traces, and unlike baggage it is structurally validated and carries no
 free-form values.
+
+## Outgoing HTTP
+
+`SetupOTelSDK` wraps `http.DefaultTransport` with otelhttp. Every call made
+through it gets a CLIENT span, and the next service receives `traceparent`,
+`baggage` and `X-Request-Id`. That covers `http.Get`, `http.DefaultClient` and
+any `http.Client` whose `Transport` is nil — no code changes.
+
+A client with its own transport bypasses that, so wrap it yourself:
+
+```go
+client := &http.Client{Transport: otel.NewTransport(&http.Transport{
+	MaxIdleConnsPerHost: 32,
+})}
+```
+
+Wrapping twice is harmless: an already-wrapped transport is returned
+unchanged, so there is never a second span per request. A request id header the
+caller set explicitly is kept.
+
+Build requests with `http.NewRequestWithContext(ctx, ...)`. Without the
+request's context the client span has no parent, so the call shows up in
+Tempo as a trace of its own and carries no request id.
+
+The one thing replacing `http.DefaultTransport` breaks is code that asserts
+`http.DefaultTransport.(*http.Transport)`. None of the Go services'
+dependencies do; check again when adding a library that tunes the default
+transport.
 
 ## Errors on spans
 
@@ -233,7 +263,7 @@ divergence.
 
 ## Instrumentation this package does not wrap
 
-Postgres/MySQL, Redis and RabbitMQ spans come from the
+MySQL, Redis and RabbitMQ spans come from the
 upstream libraries, called directly by each service:
 
 ```go
