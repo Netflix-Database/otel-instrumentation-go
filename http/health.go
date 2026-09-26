@@ -178,8 +178,14 @@ func RegisterHealth(mux *http.ServeMux, checks ...DependencyCheck) error {
 		return err
 	}
 
-	mux.Handle(otelcfg.LivenessPath, LivenessHandler())
-	mux.Handle(otelcfg.ReadinessPath, h.ReadinessHandler())
+	// Registered as "GET <path>" rather than bare paths. A service with a
+	// wildcard route such as "GET /{id}" would otherwise panic at startup:
+	// Go's mux refuses a pair where one pattern is more specific in its path
+	// and the other in its method, because neither takes precedence. The
+	// method makes the health routes strictly more specific, so they win.
+	// A GET pattern serves HEAD too, which is all a probe needs.
+	mux.Handle("GET "+otelcfg.LivenessPath, LivenessHandler())
+	mux.Handle("GET "+otelcfg.ReadinessPath, h.ReadinessHandler())
 	return nil
 }
 

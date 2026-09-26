@@ -184,3 +184,30 @@ func TestRegisterHealth(t *testing.T) {
 		}
 	}
 }
+
+// A service with a wildcard route used to panic at startup: the health routes
+// were registered without a method, and Go's mux rejects a pair where one
+// pattern is more specific in its path and the other in its method.
+func TestRegisterHealthCoexistsWithWildcardRoutes(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{fileId}", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	})
+
+	if err := RegisterHealth(mux); err != nil {
+		t.Fatalf("RegisterHealth: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", LivenessPath, nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("liveness returned %d, want 200 - the wildcard route captured it", rec.Code)
+	}
+
+	// The wildcard still serves everything else.
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/some-file-id", nil))
+	if rec.Code != http.StatusTeapot {
+		t.Errorf("wildcard route returned %d, want 418", rec.Code)
+	}
+}
