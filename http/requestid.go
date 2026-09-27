@@ -92,7 +92,18 @@ func RequestIDMiddlewareWithOptions(opts Options) func(http.Handler) http.Handle
 			span := trace.SpanFromContext(ctx)
 			span.SetAttributes(attribute.String(otelcfg.RequestIDBaggageKey, id))
 
-			next.ServeHTTP(w, r.WithContext(ctx))
+			inner := r.WithContext(ctx)
+			next.ServeHTTP(w, inner)
+
+			// A ServeMux further down writes the pattern it matched onto the
+			// copy it was handed, which the otelhttp handler outside never
+			// sees. Hand it back - otelhttp then names the span after it - and
+			// record it as http.route, which otelhttp only reads before
+			// routing.
+			if inner.Pattern != "" {
+				r.Pattern = inner.Pattern
+				recordPattern(inner)
+			}
 		})
 	}
 }

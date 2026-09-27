@@ -182,6 +182,28 @@ The one thing replacing `http.DefaultTransport` breaks is code that asserts
 dependencies do; check again when adding a library that tunes the default
 transport.
 
+## Routes
+
+Server spans carry `http.route` (the template, `/items/{id}`) and are named
+`GET /items/{id}`, which is what the shared HTTP dashboards group by. otelhttp
+only reads the route when the request starts, before any router has run, so
+this package records it after routing:
+
+- **`http.ServeMux` behind `RequestIDMiddleware`**: automatic. The middleware
+  hands the mux a copy of the request; once the handler returns, it copies the
+  matched pattern back and sets `http.route`.
+- **A chain without `RequestIDMiddleware`**: wrap the mux.
+
+  ```go
+  otelhttp.NewHandler(auth(otelMiddlewares.RouteMiddleware(mux)), "/")
+  ```
+- **A router of your own**: call `otelMiddlewares.SetRoute(r, pattern)` once it
+  has matched.
+
+Unmatched requests get no route rather than a wrong one. Always pass the
+template, never the path: `http.route` is a metric label, and a path with ids
+in it creates a new series per id.
+
 ## Errors on spans
 
 ```go
