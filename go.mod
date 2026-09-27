@@ -3,6 +3,7 @@ module github.com/Netflix-Database/otel-instrumentation-go
 go 1.25.5
 
 require (
+	github.com/XSAM/otelsql v0.44.0
 	github.com/google/uuid v1.6.0
 	github.com/hellofresh/health-go/v5 v5.5.5
 	go.opentelemetry.io/contrib/bridges/otelzap v0.20.1
